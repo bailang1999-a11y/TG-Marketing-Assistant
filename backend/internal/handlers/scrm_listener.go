@@ -93,6 +93,8 @@ type scrmListenEvent struct {
 	SourceChatID   string `json:"source_chat_id"`
 	SourceChatName string `json:"source_chat_name"`
 	MessageID      string `json:"message_id"`
+	SenderIsBot    bool   `json:"sender_is_bot"`
+	SenderType     string `json:"sender_type"`
 	UserNickname   string `json:"user_nickname"`
 	UserAccount    string `json:"user_account"`
 	TriggerWord    string `json:"trigger_word"`
@@ -118,6 +120,25 @@ func listenerMessageOriginLabel(selfSent bool) string {
 		return "自身发出"
 	}
 	return "外部"
+}
+
+func scrmListenEventFromRealtimeUser(event scrmListenEvent) bool {
+	if event.SelfSent || event.SenderIsBot {
+		return false
+	}
+	senderType := strings.ToLower(strings.TrimSpace(event.SenderType))
+	if senderType != "" && senderType != "user" {
+		return false
+	}
+	account := strings.ToLower(strings.TrimSpace(event.UserAccount))
+	nickname := strings.ToLower(strings.TrimSpace(event.UserNickname))
+	if strings.HasSuffix(strings.TrimPrefix(account, "@"), "bot") {
+		return false
+	}
+	if strings.Contains(nickname, "bot") || strings.Contains(nickname, "机器人") {
+		return false
+	}
+	return strings.TrimSpace(event.UserAccount) != "" || strings.TrimSpace(event.UserNickname) != ""
 }
 
 func (s *Server) GetSCRMListenerStatus(c *gin.Context) {
@@ -713,6 +734,9 @@ func (s *Server) consumeSCRMListenerStream(ctx context.Context, runtime *scrmLis
 		case "heartbeat":
 			runtime.lastHeartbeatAtUnix.Store(time.Now().Unix())
 		case "message":
+			if !scrmListenEventFromRealtimeUser(event) {
+				continue
+			}
 			runtime.lastEventAtUnix.Store(time.Now().Unix())
 			runtime.lastHeartbeatAtUnix.Store(time.Now().Unix())
 			s.markListenerAccountMessageSeen(context.Background(), terminal.ID)
@@ -753,6 +777,10 @@ func (s *Server) consumeSCRMListenerStream(ctx context.Context, runtime *scrmLis
 		case "warning":
 			s.logTaskBackground(context.Background(), runtime.task, "WARN", "warning", fmt.Sprintf("监听号 %s：%s", listenerTerminalLabel(terminal), event.Reason))
 		case "match":
+			if !scrmListenEventFromRealtimeUser(event) {
+				s.logTaskBackground(context.Background(), runtime.task, "INFO", "match_skip", fmt.Sprintf("监听号 %s 跳过非真人实时消息：发送者 %s，内容：%s", listenerTerminalLabel(terminal), firstNonEmpty(event.UserAccount, event.UserNickname, "未知发送者"), listenerMessagePreview(event.TriggerMessage)))
+				continue
+			}
 			runtime.matchCount.Add(1)
 			runtime.lastEventAtUnix.Store(time.Now().Unix())
 			runtime.lastHeartbeatAtUnix.Store(time.Now().Unix())
@@ -811,6 +839,11 @@ func (s *Server) consumeSCRMListenerErrors(ctx context.Context, runtime *scrmLis
 }
 
 func (s *Server) persistSCRMLeadEvent(ctx context.Context, runtime *scrmListenerRuntime, terminal models.Terminal, event scrmListenEvent) {
+	if !scrmListenEventFromRealtimeUser(event) {
+		s.logTaskBackground(context.Background(), runtime.task, "INFO", "match_skip", fmt.Sprintf("监听号 %s 跳过非真人实时消息：发送者 %s，内容：%s", listenerTerminalLabel(terminal), firstNonEmpty(event.UserAccount, event.UserNickname, "未知发送者"), listenerMessagePreview(event.TriggerMessage)))
+		return
+	}
+
 	targetID, err := uuid.Parse(event.TargetID)
 	if err != nil {
 		s.logTaskBackground(context.Background(), runtime.task, "WARN", "match_skip", "命中事件缺少有效目标 ID")

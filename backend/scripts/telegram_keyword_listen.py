@@ -139,6 +139,32 @@ def format_nickname(sender) -> str:
     return ""
 
 
+def sender_is_bot(sender) -> bool:
+    if isinstance(sender, dict):
+        return bool(sender.get("bot") or sender.get("is_bot"))
+    return bool(getattr(sender, "bot", False))
+
+
+def sender_is_real_user(sender) -> bool:
+    if sender is None or sender_is_bot(sender):
+        return False
+    if isinstance(sender, dict):
+        return bool(sender.get("id") or sender.get("username"))
+    # Telethon User objects expose first_name/last_name/bot. Channels and chats
+    # expose title/name instead, and must not become lead sources.
+    class_name = sender.__class__.__name__.lower()
+    if class_name == "user":
+        return True
+    return hasattr(sender, "first_name") or hasattr(sender, "last_name")
+
+
+def should_process_sender(event_or_message, sender) -> bool:
+    message = getattr(event_or_message, "message", event_or_message)
+    if bool(getattr(event_or_message, "out", False)) or bool(getattr(message, "out", False)):
+        return False
+    return sender_is_real_user(sender)
+
+
 def sender_id_from_message(message) -> str:
     sender_id = getattr(message, "sender_id", None)
     if sender_id:
@@ -191,6 +217,8 @@ def emit_message_event(event_type: str, args, meta: dict, chat, sender, event, m
             "type": event_type,
             "terminal": args.terminal_label,
             "self_sent": bool(getattr(event, "out", False)),
+            "sender_is_bot": sender_is_bot(sender),
+            "sender_type": "user" if sender_is_real_user(sender) else "non_user",
             "target_id": meta.get("id", ""),
             "source_chat_id": str(getattr(chat, "id", "") or ""),
             "source_chat_name": getattr(chat, "title", None) or meta.get("name", "") or "",
@@ -286,6 +314,8 @@ async def listen(args) -> int:
             try:
                 chat = await event.get_chat()
                 sender = await resolve_sender(client, event)
+                if not should_process_sender(event, sender):
+                    return
                 meta = entity_map.get(getattr(chat, "id", None), {})
                 message_text = getattr(event, "raw_text", "") or ""
                 trigger_word = match_keyword(message_text, keywords, args.match_mode)
@@ -321,6 +351,9 @@ async def listen(args) -> int:
                         chat = await client.get_entity(entity)
                         for message in fresh_messages:
                             sender = await resolve_sender(client, message)
+                            if not should_process_sender(message, sender):
+                                last_seen_message_ids[chat_id] = max(last_seen_message_ids.get(chat_id, 0), getattr(message, "id", 0))
+                                continue
                             message_text = getattr(message, "message", "") or ""
                             trigger_word = match_keyword(message_text, keywords, args.match_mode)
                             meta = entity_map.get(chat_id, {})
