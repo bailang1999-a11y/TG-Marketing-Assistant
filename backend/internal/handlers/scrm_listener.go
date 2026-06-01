@@ -457,7 +457,7 @@ func (s *Server) loadSCRMListenerTargets(ctx context.Context, tenantID uuid.UUID
 	if len(listenerTargets) > 0 {
 		targets := make([]models.Target, 0, len(listenerTargets))
 		for _, target := range listenerTargets {
-			if !strings.EqualFold(target.Type, "channel") && !strings.EqualFold(target.Type, "invite") {
+			if !isJoinableTargetType(target.Type) {
 				continue
 			}
 			targets = append(targets, models.Target{
@@ -491,12 +491,12 @@ func (s *Server) loadSCRMListenerTargets(ctx context.Context, tenantID uuid.UUID
 	}
 	filtered := make([]models.Target, 0, len(targets))
 	for _, target := range targets {
-		if strings.EqualFold(target.Type, "channel") {
+		if isJoinableTargetType(target.Type) {
 			filtered = append(filtered, target)
 		}
 	}
 	if len(filtered) == 0 {
-		return nil, errors.New("当前监听组里没有可监听的公开群组或频道")
+		return nil, errors.New("当前监听组里没有可监听的群组、频道或邀请链接")
 	}
 	return filtered, nil
 }
