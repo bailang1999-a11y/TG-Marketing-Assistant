@@ -1647,6 +1647,8 @@ func (s *Server) AssignListenerProxies(c *gin.Context) {
 	utils.OK(c, summary)
 }
 
+const listenerProxyAssignmentLimit int64 = 5
+
 func (s *Server) assignListenerProxies(c *gin.Context, proxyGroupID *uuid.UUID, accountGroupText string) (listenerAdminAssignSummary, error) {
 	return s.assignListenerProxiesToAccounts(c, proxyGroupID, accountGroupText, nil, false)
 }
@@ -1690,7 +1692,29 @@ func (s *Server) assignListenerProxiesToAccounts(c *gin.Context, proxyGroupID *u
 	}
 	usage := map[uuid.UUID]int64{}
 	for _, proxy := range proxies {
-		usage[proxy.ID] = proxy.BoundAccounts
+		usage[proxy.ID] = 0
+	}
+	accountIDSet := map[uuid.UUID]struct{}{}
+	for _, account := range accounts {
+		accountIDSet[account.ID] = struct{}{}
+	}
+	var proxyUsageRows []struct {
+		ProxyID uuid.UUID
+		Count   int64
+	}
+	usageQuery := s.db.WithContext(c.Request.Context()).
+		Model(&models.ListenerAccount{}).
+		Select("proxy_id, count(*) as count").
+		Where("tenant_id = ? AND proxy_id IN ?", tenantID, proxyIDsFromModels(proxies)).
+		Where("proxy_id IS NOT NULL")
+	if len(accountIDSet) > 0 {
+		usageQuery = usageQuery.Where("id NOT IN ?", accountIDsFromModels(accounts))
+	}
+	if err := usageQuery.Group("proxy_id").Scan(&proxyUsageRows).Error; err != nil {
+		return listenerAdminAssignSummary{}, err
+	}
+	for _, row := range proxyUsageRows {
+		usage[row.ProxyID] = row.Count
 	}
 	summary := listenerAdminAssignSummary{Accounts: len(accounts), Proxies: len(proxies)}
 	now := time.Now()
@@ -1698,7 +1722,7 @@ func (s *Server) assignListenerProxiesToAccounts(c *gin.Context, proxyGroupID *u
 	for _, account := range accounts {
 		bestIndex := -1
 		for index := range proxies {
-			if usage[proxies[index].ID] >= 3 {
+			if usage[proxies[index].ID] >= listenerProxyAssignmentLimit {
 				continue
 			}
 			if bestIndex < 0 || usage[proxies[index].ID] < usage[proxies[bestIndex].ID] {
@@ -1739,6 +1763,22 @@ func (s *Server) assignListenerProxiesToAccounts(c *gin.Context, proxyGroupID *u
 		_ = s.db.WithContext(c.Request.Context()).Model(&models.ListenerProxy{}).Where("tenant_id = ? AND id = ?", tenantID, proxy.ID).Updates(map[string]any{"bound_accounts": usage[proxy.ID], "updated_at": now}).Error
 	}
 	return summary, nil
+}
+
+func proxyIDsFromModels(proxies []models.ListenerProxy) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(proxies))
+	for _, proxy := range proxies {
+		ids = append(ids, proxy.ID)
+	}
+	return ids
+}
+
+func accountIDsFromModels(accounts []models.ListenerAccount) []uuid.UUID {
+	ids := make([]uuid.UUID, 0, len(accounts))
+	for _, account := range accounts {
+		ids = append(ids, account.ID)
+	}
+	return ids
 }
 
 func (s *Server) resolveListenerGroup(c *gin.Context, resourceType string, groupIDText string, newGroupName string) (*uuid.UUID, string, error) {

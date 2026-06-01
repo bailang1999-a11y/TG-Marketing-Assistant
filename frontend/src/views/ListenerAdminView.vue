@@ -429,8 +429,8 @@
                 </td>
                 <td>
                   <div class="proxy-bind">
-                    <span>{{ item.bound_display || `${Math.min(item.bound_accounts || 0, 3)}/3` }}</span>
-                    <i :style="{ width: `${Math.min(item.assignment_percent || ((item.bound_accounts || 0) / 3 * 100), 100)}%` }"></i>
+                    <span>{{ item.bound_display || proxyBoundDisplay(item) }}</span>
+                    <i :style="{ width: `${proxyAssignmentPercent(item)}%` }"></i>
                   </div>
                 </td>
                 <td><GlassButton variant="danger" size="sm" @click="deleteItem('proxy', item.id)">删除</GlassButton></td>
@@ -633,6 +633,7 @@ let membershipTaskTimer: ReturnType<typeof window.setInterval> | null = null
 let joinTaskTimer: ReturnType<typeof window.setInterval> | null = null
 let proxyTaskTimer: ReturnType<typeof window.setInterval> | null = null
 const batchDeleteConcurrency = 8
+const defaultProxyAssignmentLimit = 5
 
 const cards = computed(() => [
   { label: '监听号', value: overview.value?.account_count || 0, tone: 'info' },
@@ -1776,6 +1777,21 @@ function proxyCountryText(item: ListenerProxy) {
   const country = (item.country || '').trim()
   if (!country || country === '未知') return '未知国家'
   return country
+}
+
+function proxyAssignmentLimit(item: ListenerProxy) {
+  const limit = Number(item.assignment_limit || defaultProxyAssignmentLimit)
+  return Number.isFinite(limit) && limit > 0 ? limit : defaultProxyAssignmentLimit
+}
+
+function proxyBoundDisplay(item: ListenerProxy) {
+  const limit = proxyAssignmentLimit(item)
+  return `${Math.min(item.bound_accounts || 0, limit)}/${limit}`
+}
+
+function proxyAssignmentPercent(item: ListenerProxy) {
+  const fallback = (item.bound_accounts || 0) / proxyAssignmentLimit(item) * 100
+  return Math.min(item.assignment_percent || fallback, 100)
 }
 
 function formatDateTime(value?: string) {

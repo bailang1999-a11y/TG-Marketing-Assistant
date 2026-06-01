@@ -259,8 +259,8 @@ func minInt64(a, b int64) int64 {
 
 func listenerProxyRowFromModel(item models.ListenerProxy) listenerProxyRow {
 	bound := item.BoundAccounts
-	if bound > 3 {
-		bound = 3
+	if bound > listenerProxyAssignmentLimit {
+		bound = listenerProxyAssignmentLimit
 	}
 	location := strings.TrimSpace(strings.TrimSpace(item.Country) + " " + strings.TrimSpace(item.Flag))
 	if location == "" {
@@ -269,10 +269,10 @@ func listenerProxyRowFromModel(item models.ListenerProxy) listenerProxyRow {
 	return listenerProxyRow{
 		ListenerProxy:     item,
 		Endpoint:          fmt.Sprintf("%s:%d", item.IP, item.Port),
-		BoundDisplay:      fmt.Sprintf("%d/3", bound),
+		BoundDisplay:      fmt.Sprintf("%d/%d", bound, listenerProxyAssignmentLimit),
 		LocationDisplay:   location,
 		ProtocolDisplay:   listenerProxyProtocolText(item.Protocol),
-		AssignmentLimit:   3,
-		AssignmentPercent: bound * 100 / 3,
+		AssignmentLimit:   listenerProxyAssignmentLimit,
+		AssignmentPercent: bound * 100 / listenerProxyAssignmentLimit,
 	}
 }

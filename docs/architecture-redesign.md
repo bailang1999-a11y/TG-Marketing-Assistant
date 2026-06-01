@@ -495,7 +495,7 @@ backend/
 - `created_at`
 
 约束：
-- 每条代理最多绑定 3 个账号，放在服务层强校验，并为 `(tenant_id, proxy_id, listener_account_id)` 建唯一索引。
+- 每条代理最多绑定 5 个账号，放在服务层强校验，并为 `(tenant_id, proxy_id, listener_account_id)` 建唯一索引。
 
 ---
 
