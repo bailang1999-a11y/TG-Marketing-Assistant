@@ -351,6 +351,7 @@ targetLoop:
 			accounts[accountIndex] = account
 			s.recordAccountTargetJoin(ctx, uuid.Nil, accountJoinKindListener, account.ID, target, &task.ID)
 			_ = s.createTaskLogWithDuration(ctx, task, "INFO", "join_success", firstNonEmpty(result.Reason, "监听号已加入监听群"), accountRef, targetRef, duration)
+			s.notifySCRMListenerCoverageChanged(ctx)
 		} else {
 			summary.Failed++
 			_ = s.createTaskLogWithDuration(ctx, task, "ERROR", "join_failed", firstNonEmpty(row.Reason, "监听号加群失败"), accountRef, targetRef, duration)
@@ -590,6 +591,35 @@ func (s *Server) finishListenerJoinTargetsTask(ctx context.Context, task models.
 		level = "WARN"
 	}
 	_ = s.createTaskLog(ctx, task, level, "summary", detail, "", "")
+}
+
+func (s *Server) notifySCRMListenerCoverageChanged(ctx context.Context) {
+	s.listenerMu.Lock()
+	runtimes := make([]*scrmListenerRuntime, 0, len(s.listeners))
+	for _, runtime := range s.listeners {
+		if runtime != nil {
+			runtimes = append(runtimes, runtime)
+		}
+	}
+	s.listenerMu.Unlock()
+
+	for _, runtime := range runtimes {
+		if runtime.stopping.Load() || runtime.pushSubscriber != nil {
+			continue
+		}
+		covered := s.countCoveredListenerTargets(ctx, runtime.targets)
+		previous := runtime.coveredTargetCount.Load()
+		if covered <= previous {
+			continue
+		}
+		runtime.coveredTargetCount.Store(covered)
+		s.logTaskBackground(context.Background(), runtime.task, "INFO", "coverage_update", fmt.Sprintf("监听目标覆盖已增长：%d/%d", covered, len(runtime.targets)))
+		now := time.Now().Unix()
+		lastRefresh := runtime.lastCoverageRefresh.Load()
+		if covered > runtime.lastRefreshCovered.Load() && now-lastRefresh >= int64(scrmListenerCoverageRefreshInterval.Seconds()) && runtime.lastCoverageRefresh.CompareAndSwap(lastRefresh, now) {
+			go s.restartSCRMListenerRuntimeFromCoverage(context.Background(), runtime)
+		}
+	}
 }
 
 func listenerAccountJoinLabel(account models.ListenerAccount) string {

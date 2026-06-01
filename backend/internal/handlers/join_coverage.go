@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"context"
+	"hash/fnv"
 	"sort"
 	"strings"
 	"time"
@@ -35,6 +36,10 @@ func accountTargetJoinKey(targetType string, targetValue string) string {
 }
 
 func (s *Server) sortTargetsByJoinCoverage(ctx context.Context, tenantID uuid.UUID, accountKind string, targets []models.Target) []models.Target {
+	return s.sortTargetsByJoinCoverageForAccount(ctx, tenantID, accountKind, uuid.Nil, targets)
+}
+
+func (s *Server) sortTargetsByJoinCoverageForAccount(ctx context.Context, tenantID uuid.UUID, accountKind string, accountID uuid.UUID, targets []models.Target) []models.Target {
 	if len(targets) == 0 {
 		return targets
 	}
@@ -73,11 +78,127 @@ func (s *Server) sortTargetsByJoinCoverage(ctx context.Context, tenantID uuid.UU
 		leftKey := accountTargetJoinKey(sorted[i].Type, sorted[i].Identifier)
 		rightKey := accountTargetJoinKey(sorted[j].Type, sorted[j].Identifier)
 		if coverage[leftKey] == coverage[rightKey] {
+			if accountID != uuid.Nil {
+				return accountTargetTieBreakRank(accountID, sorted[i]) < accountTargetTieBreakRank(accountID, sorted[j])
+			}
 			return sorted[i].CreatedAt.Before(sorted[j].CreatedAt)
 		}
 		return coverage[leftKey] < coverage[rightKey]
 	})
 	return sorted
+}
+
+func accountTargetTieBreakRank(accountID uuid.UUID, target models.Target) uint64 {
+	key := accountTargetJoinKey(target.Type, target.Identifier)
+	if key == "" {
+		key = target.ID.String()
+	}
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(accountID.String()))
+	_, _ = h.Write([]byte{0})
+	_, _ = h.Write([]byte(key))
+	return h.Sum64()
+}
+
+func (s *Server) sortTerminalsByTargetCoverage(ctx context.Context, tenantID uuid.UUID, accountKind string, terminals []models.Terminal, targets []models.Target) []models.Terminal {
+	if len(terminals) == 0 || len(targets) == 0 {
+		return terminals
+	}
+	targetKeys := make([]string, 0, len(targets))
+	targetKeySet := map[string]struct{}{}
+	for _, target := range targets {
+		key := accountTargetJoinKey(target.Type, target.Identifier)
+		if key == "" {
+			continue
+		}
+		if _, ok := targetKeySet[key]; ok {
+			continue
+		}
+		targetKeySet[key] = struct{}{}
+		targetKeys = append(targetKeys, key)
+	}
+	if len(targetKeys) == 0 {
+		return terminals
+	}
+	accountIDs := make([]uuid.UUID, 0, len(terminals))
+	for _, terminal := range terminals {
+		accountIDs = append(accountIDs, terminal.ID)
+	}
+
+	type joinRow struct {
+		AccountID uuid.UUID
+		TargetKey string
+	}
+	var rows []joinRow
+	query := s.db.WithContext(ctx).
+		Model(&models.AccountTargetJoin{}).
+		Select("account_id, target_key").
+		Where("account_kind = ? AND active = ? AND status = ? AND account_id IN ? AND target_key IN ?", accountKind, true, accountTargetStatusActive, accountIDs, targetKeys)
+	if tenantID != uuid.Nil {
+		query = query.Where("tenant_id = ?", tenantID)
+	}
+	_ = query.Scan(&rows).Error
+
+	coverageByAccount := make(map[uuid.UUID]map[string]struct{}, len(terminals))
+	for _, row := range rows {
+		if row.TargetKey == "" {
+			continue
+		}
+		if coverageByAccount[row.AccountID] == nil {
+			coverageByAccount[row.AccountID] = map[string]struct{}{}
+		}
+		coverageByAccount[row.AccountID][row.TargetKey] = struct{}{}
+	}
+	if len(coverageByAccount) == 0 {
+		return terminals
+	}
+
+	remaining := append([]models.Terminal(nil), terminals...)
+	selected := make([]models.Terminal, 0, len(terminals))
+	covered := map[string]struct{}{}
+	for len(remaining) > 0 {
+		bestIndex := -1
+		bestGain := 0
+		bestTotal := 0
+		for index, terminal := range remaining {
+			keys := coverageByAccount[terminal.ID]
+			gain := 0
+			for key := range keys {
+				if _, ok := covered[key]; !ok {
+					gain++
+				}
+			}
+			total := len(keys)
+			if gain > bestGain || (gain == bestGain && total > bestTotal) {
+				bestIndex = index
+				bestGain = gain
+				bestTotal = total
+			}
+		}
+		if bestIndex < 0 || bestGain == 0 {
+			break
+		}
+		chosen := remaining[bestIndex]
+		selected = append(selected, chosen)
+		for key := range coverageByAccount[chosen.ID] {
+			covered[key] = struct{}{}
+		}
+		remaining = append(remaining[:bestIndex], remaining[bestIndex+1:]...)
+	}
+	if len(selected) == 0 {
+		return terminals
+	}
+	selectedIDs := make(map[uuid.UUID]struct{}, len(selected))
+	for _, terminal := range selected {
+		selectedIDs[terminal.ID] = struct{}{}
+	}
+	for _, terminal := range terminals {
+		if _, ok := selectedIDs[terminal.ID]; ok {
+			continue
+		}
+		selected = append(selected, terminal)
+	}
+	return selected
 }
 
 func (s *Server) recordAccountTargetJoin(ctx context.Context, tenantID uuid.UUID, accountKind string, accountID uuid.UUID, target models.Target, sourceTaskID *uuid.UUID) {
@@ -191,6 +312,34 @@ func (s *Server) countActiveAccountTargetJoins(ctx context.Context, tenantID uui
 		query = query.Where("tenant_id = ?", tenantID)
 	}
 	_ = query.Count(&count).Error
+	return count
+}
+
+func (s *Server) countCoveredListenerTargets(ctx context.Context, targets []models.Target) int64 {
+	if len(targets) == 0 {
+		return 0
+	}
+	keys := make([]string, 0, len(targets))
+	seen := map[string]struct{}{}
+	for _, target := range targets {
+		key := accountTargetJoinKey(target.Type, target.Identifier)
+		if key == "" {
+			continue
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		keys = append(keys, key)
+	}
+	if len(keys) == 0 {
+		return 0
+	}
+	var count int64
+	_ = s.db.WithContext(ctx).Model(&models.AccountTargetJoin{}).
+		Where("account_kind = ? AND active = ? AND status = ? AND target_key IN ?", accountJoinKindListener, true, accountTargetStatusActive, keys).
+		Distinct("target_key").
+		Count(&count).Error
 	return count
 }
 

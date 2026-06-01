@@ -68,6 +68,8 @@ export type SCRMListenerStatus = {
   rule_id?: string
   started_at?: string
   target_count: number
+  covered_target_count?: number
+  uncovered_target_count?: number
   terminal_count: number
   match_count: number
   last_event_at?: string

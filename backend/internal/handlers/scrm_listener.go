@@ -37,12 +37,18 @@ type scrmListenerRuntime struct {
 	cancel              context.CancelFunc
 	activeWorkers       atomic.Int32
 	matchCount          atomic.Int64
+	coveredTargetCount  atomic.Int64
+	lastRefreshCovered  atomic.Int64
 	lastEventAtUnix     atomic.Int64
 	lastHeartbeatAtUnix atomic.Int64
 	lastSilenceLogUnix  atomic.Int64
+	lastCoverageRefresh atomic.Int64
 	stopping            atomic.Bool
 	mu                  sync.Mutex
+	pushSubscriber      *models.BotSubscriber
 }
+
+const scrmListenerCoverageRefreshInterval = 2 * time.Minute
 
 func scrmListenerRuntimeKey(tenantID uuid.UUID, subscriberID uuid.UUID) string {
 	if subscriberID == uuid.Nil {
@@ -59,20 +65,22 @@ func scrmListenerRuntimeKeyForSubscriber(tenantID uuid.UUID, subscriber *models.
 }
 
 type scrmListenerStatusResponse struct {
-	Running         bool     `json:"running"`
-	TaskID          string   `json:"task_id,omitempty"`
-	RuleID          string   `json:"rule_id,omitempty"`
-	StartedAt       string   `json:"started_at,omitempty"`
-	TargetCount     int      `json:"target_count"`
-	TerminalCount   int      `json:"terminal_count"`
-	MatchCount      int64    `json:"match_count"`
-	LastEventAt     string   `json:"last_event_at,omitempty"`
-	LastHeartbeatAt string   `json:"last_heartbeat_at,omitempty"`
-	HealthStatus    string   `json:"health_status"`
-	HealthText      string   `json:"health_text"`
-	SilenceSeconds  int64    `json:"silence_seconds"`
-	StrikeEnabled   bool     `json:"strike_enabled"`
-	MonitorTerminal []string `json:"monitor_terminal_labels,omitempty"`
+	Running          bool     `json:"running"`
+	TaskID           string   `json:"task_id,omitempty"`
+	RuleID           string   `json:"rule_id,omitempty"`
+	StartedAt        string   `json:"started_at,omitempty"`
+	TargetCount      int      `json:"target_count"`
+	CoveredTargets   int      `json:"covered_target_count"`
+	UncoveredTargets int      `json:"uncovered_target_count"`
+	TerminalCount    int      `json:"terminal_count"`
+	MatchCount       int64    `json:"match_count"`
+	LastEventAt      string   `json:"last_event_at,omitempty"`
+	LastHeartbeatAt  string   `json:"last_heartbeat_at,omitempty"`
+	HealthStatus     string   `json:"health_status"`
+	HealthText       string   `json:"health_text"`
+	SilenceSeconds   int64    `json:"silence_seconds"`
+	StrikeEnabled    bool     `json:"strike_enabled"`
+	MonitorTerminal  []string `json:"monitor_terminal_labels,omitempty"`
 }
 
 type scrmListenTarget struct {
@@ -161,20 +169,29 @@ func (s *Server) GetSCRMListenerStatus(c *gin.Context) {
 		monitorLabels = append(monitorLabels, listenerTerminalLabel(terminal))
 	}
 	healthStatus, healthText, silenceSeconds := s.scrmListenerHealth(runtime, lastEventAt, lastHeartbeatAt)
+	coveredTargets := int(runtime.coveredTargetCount.Load())
+	if coveredTargets < 0 {
+		coveredTargets = 0
+	}
+	if coveredTargets > len(runtime.targets) {
+		coveredTargets = len(runtime.targets)
+	}
 
 	response := scrmListenerStatusResponse{
-		Running:         runtime.activeWorkers.Load() > 0,
-		TaskID:          runtime.task.ID.String(),
-		RuleID:          runtime.rule.ID.String(),
-		StartedAt:       runtime.startedAt.Format(time.RFC3339),
-		TargetCount:     len(runtime.targets),
-		TerminalCount:   len(runtime.terminals),
-		MatchCount:      runtime.matchCount.Load(),
-		HealthStatus:    healthStatus,
-		HealthText:      healthText,
-		SilenceSeconds:  silenceSeconds,
-		StrikeEnabled:   runtime.rule.StrikeEnabled,
-		MonitorTerminal: monitorLabels,
+		Running:          !runtime.stopping.Load(),
+		TaskID:           runtime.task.ID.String(),
+		RuleID:           runtime.rule.ID.String(),
+		StartedAt:        runtime.startedAt.Format(time.RFC3339),
+		TargetCount:      len(runtime.targets),
+		CoveredTargets:   coveredTargets,
+		UncoveredTargets: maxInt(len(runtime.targets)-coveredTargets, 0),
+		TerminalCount:    len(runtime.terminals),
+		MatchCount:       runtime.matchCount.Load(),
+		HealthStatus:     healthStatus,
+		HealthText:       healthText,
+		SilenceSeconds:   silenceSeconds,
+		StrikeEnabled:    runtime.rule.StrikeEnabled,
+		MonitorTerminal:  monitorLabels,
 	}
 	if lastEventAt > 0 {
 		response.LastEventAt = time.Unix(lastEventAt, 0).Format(time.RFC3339)
@@ -186,7 +203,13 @@ func (s *Server) GetSCRMListenerStatus(c *gin.Context) {
 }
 
 func (s *Server) scrmListenerHealth(runtime *scrmListenerRuntime, lastEventAt int64, lastHeartbeatAt int64) (string, string, int64) {
-	if runtime == nil || runtime.activeWorkers.Load() <= 0 {
+	if runtime == nil {
+		return "stopped", "监听未运行", 0
+	}
+	if runtime.activeWorkers.Load() <= 0 {
+		if runtime.coveredTargetCount.Load() <= 0 && len(runtime.targets) > 0 {
+			return "waiting_coverage", "等待监听号加入目标群，加入后会自动开始实时监听", 0
+		}
 		return "stopped", "监听未运行", 0
 	}
 	now := time.Now().Unix()
@@ -284,6 +307,7 @@ func (s *Server) startSCRMListenerRuntime(ctx context.Context, tenantID uuid.UUI
 	if err != nil {
 		return models.Task{}, err
 	}
+	terminals = s.sortTerminalsByTargetCoverage(ctx, uuid.Nil, accountJoinKindListener, terminals, targets)
 
 	task, err := s.createSCRMListenerTask(ctx, tenantID, rule, targets, terminals, createdBy, pushSubscriber)
 	if err != nil {
@@ -305,14 +329,20 @@ func (s *Server) startSCRMListenerRuntime(ctx context.Context, tenantID uuid.UUI
 		ownerUserID = pushSubscriber.UserID
 	}
 	runtime := &scrmListenerRuntime{
-		key:         tenantKey,
-		task:        task,
-		rule:        rule,
-		terminals:   terminals,
-		targets:     targets,
-		ownerUserID: ownerUserID,
-		startedAt:   time.Now(),
-		cancel:      cancel,
+		key:            tenantKey,
+		task:           task,
+		rule:           rule,
+		terminals:      terminals,
+		targets:        targets,
+		ownerUserID:    ownerUserID,
+		startedAt:      time.Now(),
+		cancel:         cancel,
+		pushSubscriber: pushSubscriber,
+	}
+	runtime.coveredTargetCount.Store(s.countCoveredListenerTargets(ctx, targets))
+	runtime.lastRefreshCovered.Store(runtime.coveredTargetCount.Load())
+	if runtime.coveredTargetCount.Load() > 0 {
+		runtime.lastCoverageRefresh.Store(time.Now().Unix())
 	}
 	s.listeners[tenantKey] = runtime
 	s.listenerMu.Unlock()
@@ -321,14 +351,96 @@ func (s *Server) startSCRMListenerRuntime(ctx context.Context, tenantID uuid.UUI
 		Where("tenant_id = ? AND id = ?", tenantID, rule.ID).
 		Updates(map[string]any{"status": "running", "updated_at": time.Now()}).Error
 	s.updateTaskState(ctx, task.ID, "running", 5, nil)
-	s.logTaskBackground(ctx, task, "INFO", "start", fmt.Sprintf("开始监听：监听组 %d 个目标，监听号 %d 个，匹配模式 %s，出击 %t", len(targets), len(terminals), rule.MatchMode, rule.StrikeEnabled))
+	coveredTargets := int(runtime.coveredTargetCount.Load())
+	s.logTaskBackground(ctx, task, "INFO", "start", fmt.Sprintf("开始监听：监听组 %d 个目标，已覆盖 %d 个，待覆盖 %d 个，监听号 %d 个，匹配模式 %s，出击 %t", len(targets), coveredTargets, maxInt(len(targets)-coveredTargets, 0), len(terminals), rule.MatchMode, rule.StrikeEnabled))
 	go s.monitorSCRMListenerHealth(runCtx, runtime)
+	if pushSubscriber == nil {
+		s.ensureSCRMListenerCoverageTask(ctx, tenantID, task, createdBy)
+	}
 
+	if coveredTargets == 0 {
+		s.logTaskBackground(ctx, task, "INFO", "coverage_wait", "当前还没有监听号覆盖目标群，已启动自动补覆盖任务，首批目标加入后会自动刷新实时监听。")
+		return task, nil
+	}
 	for _, terminal := range terminals {
 		runtime.activeWorkers.Add(1)
 		go s.runSCRMListenerWorker(runCtx, tenantID, runtime, terminal)
 	}
 	return task, nil
+}
+
+func (s *Server) restartSCRMListenerRuntimeFromCoverage(ctx context.Context, runtime *scrmListenerRuntime) {
+	if runtime == nil || runtime.stopping.Load() || runtime.pushSubscriber != nil {
+		return
+	}
+	runtime.stopping.Store(true)
+	runtime.cancel()
+	if _, err := s.startSCRMListenerRuntime(ctx, runtime.task.TenantID, runtime.rule, runtime.ownerUserID, nil); err != nil {
+		runtime.stopping.Store(false)
+		s.logTaskBackground(context.Background(), runtime.task, "ERROR", "coverage_refresh", "监听覆盖刷新失败："+err.Error())
+		return
+	}
+	s.updateTaskState(context.Background(), runtime.task.ID, "stopped", 100, s.listenerSummary(runtime))
+	s.logTaskBackground(context.Background(), runtime.task, "INFO", "coverage_refresh", "监听目标覆盖已增长，已自动刷新实时监听进程。")
+}
+
+func (s *Server) ensureSCRMListenerCoverageTask(ctx context.Context, tenantID uuid.UUID, listenerTask models.Task, createdBy *uuid.UUID) {
+	if s.hasRunningListenerCoverageTask(ctx) {
+		s.logTaskBackground(ctx, listenerTask, "INFO", "coverage_task", "监听号自动补覆盖任务已在运行，本次复用现有任务。")
+		return
+	}
+	var accounts []models.ListenerAccount
+	if err := s.db.WithContext(ctx).Where("tenant_id = ?", uuid.Nil).Order("created_at asc").Find(&accounts).Error; err != nil || len(accounts) == 0 {
+		s.logTaskBackground(ctx, listenerTask, "WARN", "coverage_task", "无法启动监听号自动补覆盖：没有可用监听号。")
+		return
+	}
+	var targets []models.ListenerTarget
+	if err := s.db.WithContext(ctx).Where("tenant_id = ?", uuid.Nil).Order("created_at asc").Find(&targets).Error; err != nil || len(targets) == 0 {
+		s.logTaskBackground(ctx, listenerTask, "WARN", "coverage_task", "无法启动监听号自动补覆盖：没有监听目标。")
+		return
+	}
+	coveredTargets := int(s.countCoveredListenerTargets(ctx, listenerTargetsAsTargets(targets)))
+	uncoveredTargets := maxInt(len(targets)-coveredTargets, 0)
+	if uncoveredTargets == 0 {
+		s.logTaskBackground(ctx, listenerTask, "INFO", "coverage_task", "监听矩阵目标已经全部有监听号覆盖。")
+		return
+	}
+	req := normalizeListenerJoinTargetsRequest(listenerJoinTargetsRequest{
+		AccountScope:    "all",
+		TargetScope:     "all",
+		DailyLimit:      5,
+		IntervalMinutes: 30,
+		MaxJoins:        uncoveredTargets,
+		PreferUncovered: true,
+	})
+	payload, _ := json.Marshal(req)
+	task := models.Task{
+		ID:        uuid.New(),
+		TenantID:  uuid.Nil,
+		Name:      "监听号自动补覆盖",
+		Type:      "listener_join_targets",
+		Status:    "queued",
+		Progress:  0,
+		Payload:   datatypes.JSON(payload),
+		CreatedBy: createdBy,
+	}
+	if err := s.db.WithContext(ctx).Create(&task).Error; err != nil {
+		s.logTaskBackground(ctx, listenerTask, "WARN", "coverage_task", "创建监听号自动补覆盖任务失败："+err.Error())
+		return
+	}
+	_ = s.createTaskLog(ctx, task, "INFO", "created", fmt.Sprintf("监听启动后自动补覆盖：%d 个监听号，%d 个监听目标，已覆盖 %d 个，待覆盖 %d 个，每号每日 %d 个，间隔 %d 分钟", len(accounts), len(targets), coveredTargets, uncoveredTargets, req.DailyLimit, req.IntervalMinutes), "", "")
+	s.logTaskBackground(ctx, listenerTask, "INFO", "coverage_task", "已启动监听号自动补覆盖任务："+task.ID.String())
+	if !s.enqueueTask(ctx, task, "run") {
+		go s.runListenerJoinTargetsTask(context.Background(), task, accounts, targets, req)
+	}
+}
+
+func (s *Server) hasRunningListenerCoverageTask(ctx context.Context) bool {
+	var count int64
+	_ = s.db.WithContext(ctx).Model(&models.Task{}).
+		Where("tenant_id = ? AND type = ? AND status IN ?", uuid.Nil, "listener_join_targets", []string{"queued", "running"}).
+		Count(&count).Error
+	return count > 0
 }
 
 func (s *Server) PauseSCRMListenerRule(c *gin.Context) {
@@ -573,14 +685,14 @@ func (s *Server) runSCRMListenerWorker(ctx context.Context, tenantID uuid.UUID, 
 		if remaining > 0 {
 			return
 		}
+		if runtime.stopping.Load() {
+			return
+		}
 		s.listenerMu.Lock()
 		if current := s.listeners[runtime.key]; current == runtime {
 			delete(s.listeners, runtime.key)
 		}
 		s.listenerMu.Unlock()
-		if runtime.stopping.Load() {
-			return
-		}
 		s.updateTaskState(context.Background(), runtime.task.ID, "failed", 100, nil)
 		s.logTaskBackground(context.Background(), runtime.task, "ERROR", "worker_exit", "所有监听进程都已退出，监听已停止")
 	}()
@@ -677,7 +789,6 @@ func (s *Server) runSCRMListenerWorker(ctx context.Context, tenantID uuid.UUID, 
 
 func (s *Server) prepareSCRMListenerWorkerTargets(ctx context.Context, tenantID uuid.UUID, runtime *scrmListenerRuntime, terminal models.Terminal) []models.Target {
 	sortedTargets := s.sortTargetsByJoinCoverage(ctx, uuid.Nil, accountJoinKindListener, runtime.targets)
-	joiner := telegram_client.NewJoiner(s.cfg)
 	readyTargets := make([]models.Target, 0, len(sortedTargets))
 	for _, target := range sortedTargets {
 		if !isJoinableTargetType(target.Type) {
@@ -687,25 +798,6 @@ func (s *Server) prepareSCRMListenerWorkerTargets(ctx context.Context, tenantID 
 			readyTargets = append(readyTargets, target)
 			continue
 		}
-		if _, err := s.reserveListenerJoinQuota(ctx, terminal.ID); err != nil {
-			s.logTaskBackground(context.Background(), runtime.task, "WARN", "listener_join_skipped", fmt.Sprintf("监听号 %s 加入 %s 已跳过：%s", listenerTerminalLabel(terminal), targetJoinLabel(target), err.Error()))
-			continue
-		}
-		result, err := joiner.Join(ctx, telegram_client.JoinRequest{
-			FilePath:   terminal.FilePath,
-			AccessType: terminal.AccessType,
-			TargetType: target.Type,
-			Identifier: target.Identifier,
-			Proxy:      s.listenerAccountProxyConfigByID(ctx, uuid.Nil, terminal.ID),
-		})
-		if err != nil || !result.OK {
-			reason := firstNonEmpty(result.Reason, "监听账号加群失败")
-			s.logTaskBackground(context.Background(), runtime.task, "WARN", "listener_join_failed", fmt.Sprintf("监听号 %s 加入 %s 失败：%s", listenerTerminalLabel(terminal), targetJoinLabel(target), reason))
-			continue
-		}
-		s.recordAccountTargetJoin(ctx, uuid.Nil, accountJoinKindListener, terminal.ID, target, &runtime.task.ID)
-		readyTargets = append(readyTargets, target)
-		s.logTaskBackground(context.Background(), runtime.task, "INFO", "listener_join_success", fmt.Sprintf("监听号 %s 已加入 %s：%s", listenerTerminalLabel(terminal), targetJoinLabel(target), firstNonEmpty(result.Reason, "已加入目标")))
 	}
 	return readyTargets
 }
@@ -804,6 +896,19 @@ func (s *Server) monitorSCRMListenerHealth(ctx context.Context, runtime *scrmLis
 				return
 			}
 			status, text, _ := s.scrmListenerHealth(runtime, runtime.lastEventAtUnix.Load(), runtime.lastHeartbeatAtUnix.Load())
+			coveredTargets := s.countCoveredListenerTargets(context.Background(), runtime.targets)
+			previousCovered := runtime.coveredTargetCount.Load()
+			if coveredTargets > previousCovered {
+				runtime.coveredTargetCount.Store(coveredTargets)
+				s.logTaskBackground(context.Background(), runtime.task, "INFO", "coverage_update", fmt.Sprintf("监听目标覆盖已增长：%d/%d", coveredTargets, len(runtime.targets)))
+			}
+			if runtime.pushSubscriber == nil && coveredTargets > runtime.lastRefreshCovered.Load() {
+				now := time.Now().Unix()
+				lastRefresh := runtime.lastCoverageRefresh.Load()
+				if now-lastRefresh >= int64(scrmListenerCoverageRefreshInterval.Seconds()) && runtime.lastCoverageRefresh.CompareAndSwap(lastRefresh, now) {
+					go s.restartSCRMListenerRuntimeFromCoverage(context.Background(), runtime)
+				}
+			}
 			s.updateTaskState(context.Background(), runtime.task.ID, "running", 100, s.listenerSummary(runtime))
 			if status == "silent" || status == "stale" {
 				now := time.Now().Unix()
@@ -929,14 +1034,23 @@ func (s *Server) scrmLeadEventAlreadyCaptured(ctx context.Context, tenantID uuid
 }
 
 func (s *Server) listenerSummary(runtime *scrmListenerRuntime) datatypes.JSON {
+	coveredTargets := int(runtime.coveredTargetCount.Load())
+	if coveredTargets < 0 {
+		coveredTargets = 0
+	}
+	if coveredTargets > len(runtime.targets) {
+		coveredTargets = len(runtime.targets)
+	}
 	summary, _ := json.Marshal(gin.H{
-		"target_count":      len(runtime.targets),
-		"terminal_count":    len(runtime.terminals),
-		"match_count":       runtime.matchCount.Load(),
-		"started_at":        runtime.startedAt.Format(time.RFC3339),
-		"last_event_at":     unixTimeString(runtime.lastEventAtUnix.Load()),
-		"last_heartbeat_at": unixTimeString(runtime.lastHeartbeatAtUnix.Load()),
-		"strike_enabled":    runtime.rule.StrikeEnabled,
+		"target_count":           len(runtime.targets),
+		"covered_target_count":   coveredTargets,
+		"uncovered_target_count": maxInt(len(runtime.targets)-coveredTargets, 0),
+		"terminal_count":         len(runtime.terminals),
+		"match_count":            runtime.matchCount.Load(),
+		"started_at":             runtime.startedAt.Format(time.RFC3339),
+		"last_event_at":          unixTimeString(runtime.lastEventAtUnix.Load()),
+		"last_heartbeat_at":      unixTimeString(runtime.lastHeartbeatAtUnix.Load()),
+		"strike_enabled":         runtime.rule.StrikeEnabled,
 	})
 	return datatypes.JSON(summary)
 }

@@ -44,7 +44,7 @@
       </div>
       <div class="outreach-stat">
         <span>监听目标</span>
-        <strong>{{ listenerStatus?.target_count ?? 0 }} 个</strong>
+        <strong>{{ listenerTargetCoverageText }}</strong>
       </div>
       <div class="outreach-stat">
         <span>命中线索</span>
@@ -446,6 +446,12 @@ const listenerHealthTone = computed(() => {
 const listenerHealthText = computed(() => {
   if (!listenerStatus.value?.running) return '监听未启动'
   return listenerStatus.value.health_text || '等待监听心跳'
+})
+const listenerTargetCoverageText = computed(() => {
+  const total = listenerStatus.value?.target_count ?? 0
+  const covered = listenerStatus.value?.covered_target_count
+  if (typeof covered === 'number') return `${covered}/${total} 个`
+  return `${total} 个`
 })
 const listenerHeartbeatText = computed(() => {
   if (!listenerStatus.value?.running) return '未启动'
