@@ -51,6 +51,16 @@ type listenerJoinTargetsSummary struct {
 	Items         []joinTargetsResultRow `json:"items"`
 }
 
+type listenerJoinAttempt struct {
+	AccountIndex int
+	Account      models.ListenerAccount
+	AccountRef   string
+	Result       telegram_client.JoinResult
+	Err          error
+	DurationMS   int64
+	Reason       string
+}
+
 func (s *Server) CreateListenerJoinTargetsTask(c *gin.Context) {
 	var req listenerJoinTargetsRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -241,6 +251,7 @@ func (s *Server) runListenerJoinTargetsTask(ctx context.Context, task models.Tas
 	_ = s.createTaskLog(ctx, task, "INFO", "start", fmt.Sprintf("开始监听号自动加群：%d 个监听号，%d 个监听群，优先未覆盖目标", len(accounts), len(targets)), "", "")
 	joiner := telegram_client.NewJoiner(s.cfg)
 	inspector := telegram_client.NewTargetInspector(s.cfg)
+	blockedAccounts := map[uuid.UUID]string{}
 	done := 0
 targetLoop:
 	for _, target := range targets {
@@ -261,17 +272,66 @@ targetLoop:
 			s.updateListenerJoinTargetsProgress(ctx, task.ID, done, summary.Total, summary)
 			continue
 		}
-		var accountIndex int
-		var account models.ListenerAccount
+		attempts := make([]listenerJoinAttempt, 0)
 		for {
 			var quotaErr error
 			accounts = s.refreshListenerJoinAccounts(ctx, accounts)
-			accountIndex, account, quotaErr = s.pickListenerJoinAccount(ctx, accounts, target, req, inspector)
+			accountIndex, account, quotaErr := s.pickListenerJoinAccount(ctx, accounts, target, req, inspector, blockedAccounts)
 			if quotaErr == nil {
+				accountRef := listenerAccountJoinLabel(account)
+				start := time.Now()
+				result, err := joiner.Join(ctx, telegram_client.JoinRequest{
+					FilePath:   account.FilePath,
+					AccessType: account.AccessType,
+					TargetType: target.Type,
+					Identifier: target.Identifier,
+					Proxy:      s.listenerAccountProxyConfig(ctx, uuid.Nil, account),
+				})
+				duration := time.Since(start).Milliseconds()
+				reason := result.Reason
+				if strings.TrimSpace(reason) == "" && err != nil {
+					reason = err.Error()
+				}
+				attempt := listenerJoinAttempt{
+					AccountIndex: accountIndex,
+					Account:      account,
+					AccountRef:   accountRef,
+					Result:       result,
+					Err:          err,
+					DurationMS:   duration,
+					Reason:       reason,
+				}
+				attempts = append(attempts, attempt)
+				if err == nil && result.OK {
+					row.TerminalID = account.ID.String()
+					row.Terminal = accountRef
+					row.Status = firstNonEmpty(result.Status, "success")
+					row.Reason = firstNonEmpty(result.Reason, "监听号已加入监听群")
+					summary.Success++
+					accounts[accountIndex] = account
+					s.recordAccountTargetJoin(ctx, uuid.Nil, accountJoinKindListener, account.ID, target, &task.ID)
+					_ = s.createTaskLogWithDuration(ctx, task, "INFO", "join_success", row.Reason, accountRef, targetRef, duration)
+					s.notifySCRMListenerCoverageChanged(ctx)
+					break
+				}
+				if s.shouldRetryListenerJoinWithAnotherAccount(reason) {
+					s.applyListenerJoinFailure(ctx, account, reason)
+					if s.shouldBlockListenerAccountForJoinTask(reason) {
+						blockedAccounts[account.ID] = firstNonEmpty(reason, "监听号加群失败")
+					}
+					_ = s.createTaskLogWithDuration(ctx, task, "WARN", "join_retry", fmt.Sprintf("%s 加群失败，已换下一个监听号继续覆盖：%s", accountRef, firstNonEmpty(reason, "监听号加群失败")), accountRef, targetRef, duration)
+					continue
+				}
+				row.TerminalID = account.ID.String()
+				row.Terminal = accountRef
+				row.Status = firstNonEmpty(result.Status, "failed")
+				row.Reason = firstNonEmpty(reason, "监听号加群失败")
+				summary.Failed++
+				_ = s.createTaskLogWithDuration(ctx, task, "ERROR", "join_failed", row.Reason, accountRef, targetRef, duration)
 				break
 			}
 			accounts = s.refreshListenerJoinAccounts(ctx, accounts)
-			waitUntil, waitReason := s.nextListenerJoinAccountRetryAt(ctx, accounts, target, req)
+			waitUntil, waitReason := s.nextListenerJoinAccountRetryAt(ctx, accounts, target, req, blockedAccounts)
 			if waitUntil == nil || !waitUntil.After(time.Now()) {
 				if isListenerJoinResolutionExhaustedReason(quotaErr.Error()) {
 					row.Status = "failed"
@@ -329,32 +389,17 @@ targetLoop:
 			summary.WaitingReason = ""
 			summary.WaitingUntil = ""
 		}
-		accountRef := listenerAccountJoinLabel(account)
-		row.TerminalID = account.ID.String()
-		row.Terminal = accountRef
-		start := time.Now()
-		result, err := joiner.Join(ctx, telegram_client.JoinRequest{
-			FilePath:   account.FilePath,
-			AccessType: account.AccessType,
-			TargetType: target.Type,
-			Identifier: target.Identifier,
-			Proxy:      s.listenerAccountProxyConfig(ctx, uuid.Nil, account),
-		})
-		duration := time.Since(start).Milliseconds()
-		row.Status = firstNonEmpty(result.Status, "failed")
-		row.Reason = result.Reason
-		if row.Reason == "" && err != nil {
-			row.Reason = err.Error()
-		}
-		if err == nil && result.OK {
-			summary.Success++
-			accounts[accountIndex] = account
-			s.recordAccountTargetJoin(ctx, uuid.Nil, accountJoinKindListener, account.ID, target, &task.ID)
-			_ = s.createTaskLogWithDuration(ctx, task, "INFO", "join_success", firstNonEmpty(result.Reason, "监听号已加入监听群"), accountRef, targetRef, duration)
-			s.notifySCRMListenerCoverageChanged(ctx)
-		} else {
-			summary.Failed++
-			_ = s.createTaskLogWithDuration(ctx, task, "ERROR", "join_failed", firstNonEmpty(row.Reason, "监听号加群失败"), accountRef, targetRef, duration)
+		if row.Status == "" {
+			row.Status = "skipped"
+			row.Reason = "没有可用监听号"
+			for i := len(attempts) - 1; i >= 0; i-- {
+				if strings.TrimSpace(attempts[i].Reason) != "" {
+					row.Reason = attempts[i].Reason
+					break
+				}
+			}
+			summary.Skipped++
+			accumulateSkipReason(summary.SkipReasons, row.Reason)
 		}
 		summary.Items = append(summary.Items, row)
 		done++
@@ -372,6 +417,68 @@ targetLoop:
 	}
 	summary.TopSkipReason = topSkipReason(summary.SkipReasons)
 	s.finishListenerJoinTargetsTask(ctx, task, status, summary, fmt.Sprintf("监听号自动加群完成：成功 %d，失败 %d，跳过 %d", summary.Success, summary.Failed, summary.Skipped))
+}
+
+func (s *Server) applyListenerJoinFailure(ctx context.Context, account models.ListenerAccount, reason string) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return
+	}
+	updates := map[string]any{"updated_at": time.Now()}
+	switch {
+	case telegram_client.IsFrozenAccountReason(reason):
+		updates["status"] = "abnormal"
+		updates["risk_status"] = "账号冻结"
+	case terminalFloodWaitUntil(reason) != nil:
+		updates["risk_status"] = "限流冷却"
+		updates["join_cooldown_until"] = terminalFloodWaitUntil(reason)
+	case terminalNeedsRelogin(reason):
+		updates["status"] = "abnormal"
+		updates["risk_status"] = "需重新登录"
+	case terminalNeedsReimport(reason):
+		updates["status"] = "abnormal"
+		updates["risk_status"] = "需重新导入"
+	default:
+		return
+	}
+	_ = s.db.WithContext(ctx).Model(&models.ListenerAccount{}).Where("id = ?", account.ID).Updates(updates).Error
+	if _, ok := updates["status"]; ok {
+		s.markAccountJoinRecordsUnavailable(ctx, uuid.Nil, accountJoinKindListener, account.ID, reason)
+	}
+}
+
+func (s *Server) shouldRetryListenerJoinWithAnotherAccount(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return false
+	}
+	if terminalFloodWaitUntil(reason) != nil ||
+		terminalNeedsRelogin(reason) ||
+		terminalNeedsReimport(reason) ||
+		telegram_client.IsFrozenAccountReason(reason) {
+		return true
+	}
+	lowered := strings.ToLower(reason)
+	return strings.Contains(lowered, "database is locked") ||
+		strings.Contains(lowered, "session") && strings.Contains(lowered, "locked")
+}
+
+func (s *Server) shouldBlockListenerAccountForJoinTask(reason string) bool {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		return false
+	}
+	if terminalFloodWaitUntil(reason) != nil {
+		return false
+	}
+	if terminalNeedsRelogin(reason) ||
+		terminalNeedsReimport(reason) ||
+		telegram_client.IsFrozenAccountReason(reason) {
+		return true
+	}
+	lowered := strings.ToLower(reason)
+	return strings.Contains(lowered, "database is locked") ||
+		strings.Contains(lowered, "session") && strings.Contains(lowered, "locked")
 }
 
 func listenerTargetsAsTargets(items []models.ListenerTarget) []models.Target {
@@ -392,10 +499,14 @@ func listenerTargetsAsTargets(items []models.ListenerTarget) []models.Target {
 	return targets
 }
 
-func (s *Server) pickListenerJoinAccount(ctx context.Context, accounts []models.ListenerAccount, target models.Target, req listenerJoinTargetsRequest, inspector telegram_client.TargetInspector) (int, models.ListenerAccount, error) {
+func (s *Server) pickListenerJoinAccount(ctx context.Context, accounts []models.ListenerAccount, target models.Target, req listenerJoinTargetsRequest, inspector telegram_client.TargetInspector, blocked map[uuid.UUID]string) (int, models.ListenerAccount, error) {
 	reasons := []string{}
 	resolutionFailures := []string{}
 	for index, account := range accounts {
+		if reason := blocked[account.ID]; strings.TrimSpace(reason) != "" {
+			reasons = append(reasons, fmt.Sprintf("%s：%s", listenerAccountJoinLabel(account), reason))
+			continue
+		}
 		if req.SkipAlreadyJoined && s.accountTargetAlreadyJoined(ctx, uuid.Nil, accountJoinKindListener, account.ID, target) {
 			reasons = append(reasons, fmt.Sprintf("%s 已加入该监听群", listenerAccountJoinLabel(account)))
 			continue
@@ -483,10 +594,13 @@ func (s *Server) refreshListenerJoinAccounts(ctx context.Context, accounts []mod
 	return refreshed
 }
 
-func (s *Server) nextListenerJoinAccountRetryAt(ctx context.Context, accounts []models.ListenerAccount, target models.Target, req listenerJoinTargetsRequest) (*time.Time, string) {
+func (s *Server) nextListenerJoinAccountRetryAt(ctx context.Context, accounts []models.ListenerAccount, target models.Target, req listenerJoinTargetsRequest, blocked map[uuid.UUID]string) (*time.Time, string) {
 	now := time.Now()
 	var earliest *time.Time
 	for _, account := range accounts {
+		if strings.TrimSpace(blocked[account.ID]) != "" {
+			continue
+		}
 		if req.SkipAlreadyJoined && s.accountTargetAlreadyJoined(ctx, uuid.Nil, accountJoinKindListener, account.ID, target) {
 			continue
 		}
