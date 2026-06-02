@@ -11,7 +11,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const dashboardCacheTTL = 5 * time.Second
+const dashboardCacheTTL = 30 * time.Second // 优化：5s -> 30s，减少聚合查询频率
 
 type dashboardCacheEntry struct {
 	expiresAt time.Time

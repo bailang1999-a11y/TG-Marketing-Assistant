@@ -1194,7 +1194,7 @@ function trackMembershipTask(task: Task) {
   activeMembershipTask.value = task
   refreshingMemberships.value = true
   if (membershipTaskTimer) window.clearInterval(membershipTaskTimer)
-  membershipTaskTimer = window.setInterval(pollMembershipTask, 2500)
+  membershipTaskTimer = window.setInterval(pollMembershipTask, 8000) // 优化：2.5s -> 8s
 }
 
 function trackAccountTask(task: Task) {
@@ -1202,13 +1202,13 @@ function trackAccountTask(task: Task) {
   checkingAccounts.value = true
   ui.trackTask({ id: task.id, title: '监听账号状态检测', startedAt: Date.now() })
   if (accountTaskTimer) window.clearInterval(accountTaskTimer)
-  accountTaskTimer = window.setInterval(pollAccountTask, 2500)
+  accountTaskTimer = window.setInterval(pollAccountTask, 8000) // 优化：2.5s -> 8s
 }
 
 function trackJoinTask(task: Task) {
   activeJoinTask.value = task
   if (joinTaskTimer) window.clearInterval(joinTaskTimer)
-  joinTaskTimer = window.setInterval(pollJoinTask, 2500)
+  joinTaskTimer = window.setInterval(pollJoinTask, 8000) // 优化：2.5s -> 8s
 }
 
 function trackProxyTask(task: Task) {
@@ -1216,7 +1216,7 @@ function trackProxyTask(task: Task) {
   checkingProxies.value = true
   ui.trackTask({ id: task.id, title: '代理延迟检测', startedAt: Date.now() })
   if (proxyTaskTimer) window.clearInterval(proxyTaskTimer)
-  proxyTaskTimer = window.setInterval(pollProxyTask, 2500)
+  proxyTaskTimer = window.setInterval(pollProxyTask, 8000) // 优化：2.5s -> 8s
 }
 
 async function pollAccountTask() {

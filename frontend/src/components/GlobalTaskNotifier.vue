@@ -51,7 +51,7 @@ async function pollTrackedTasks() {
 }
 
 onMounted(() => {
-  timer = window.setInterval(pollTrackedTasks, 4000)
+  timer = window.setInterval(pollTrackedTasks, 30000) // 优化：4s -> 30s，降低数据库压力
   void pollTrackedTasks()
 })
 

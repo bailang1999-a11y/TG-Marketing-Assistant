@@ -684,7 +684,7 @@ function trackRefreshTask(task: Task) {
   activeRefreshTask.value = task
   refreshingMemberships.value = true
   if (refreshTaskTimer) window.clearInterval(refreshTaskTimer)
-  refreshTaskTimer = window.setInterval(pollRefreshTask, 2500)
+  refreshTaskTimer = window.setInterval(pollRefreshTask, 8000) // 优化：2.5s -> 8s
 }
 
 async function pollRefreshTask() {

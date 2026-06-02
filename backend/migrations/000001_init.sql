@@ -196,7 +196,7 @@ CREATE TABLE IF NOT EXISTS task_logs (
     terminal_ref VARCHAR(160),
     target_ref VARCHAR(160),
     action VARCHAR(120),
-    details VARCHAR(1000),
+    details VARCHAR(5000),
     duration_ms BIGINT DEFAULT 0,
     trace_id VARCHAR(80),
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()

@@ -539,15 +539,29 @@ func (s *Server) pickListenerJoinAccount(ctx context.Context, accounts []models.
 		return index, reserved, nil
 	}
 	if len(resolutionFailures) > 0 && len(reasons) == 0 {
-		return -1, models.ListenerAccount{}, fmt.Errorf("没有可解析该监听群的监听号：%s", strings.Join(resolutionFailures, "；"))
+		return -1, models.ListenerAccount{}, fmt.Errorf("没有可解析该监听群的监听号：%s", summarizeListenerJoinReasons(resolutionFailures))
 	}
 	if len(resolutionFailures) > 0 {
 		reasons = append(reasons, resolutionFailures...)
 	}
 	if len(reasons) > 0 {
-		return -1, models.ListenerAccount{}, fmt.Errorf("没有可用监听号：%s", strings.Join(reasons, "；"))
+		return -1, models.ListenerAccount{}, fmt.Errorf("没有可用监听号：%s", summarizeListenerJoinReasons(reasons))
 	}
 	return -1, models.ListenerAccount{}, fmt.Errorf("没有可用监听号")
+}
+
+// summarizeListenerJoinReasons 把多个账号的失败原因拼成摘要，
+// 只保留前若干条并归并相同原因，避免拼出超长字符串撑爆 task_logs.details。
+func summarizeListenerJoinReasons(reasons []string) string {
+	const maxListed = 5
+	if len(reasons) == 0 {
+		return ""
+	}
+	if len(reasons) <= maxListed {
+		return strings.Join(reasons, "；")
+	}
+	listed := strings.Join(reasons[:maxListed], "；")
+	return fmt.Sprintf("%s；……共 %d 个监听号不可用（已省略 %d 条）", listed, len(reasons), len(reasons)-maxListed)
 }
 
 func listenerJoinShouldPreflightResolve(target models.Target) bool {

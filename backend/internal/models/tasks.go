@@ -34,7 +34,7 @@ type TaskLog struct {
 	TerminalRef string    `json:"terminal_ref" gorm:"size:160"`
 	TargetRef   string    `json:"target_ref" gorm:"size:160"`
 	Action      string    `json:"action" gorm:"size:120"`
-	Details     string    `json:"details" gorm:"size:1000"`
+	Details     string    `json:"details" gorm:"size:5000"`
 	DurationMS  int64     `json:"duration_ms"`
 	TraceID     string    `json:"trace_id" gorm:"size:80;index"`
 	CreatedAt   time.Time `json:"created_at" gorm:"index;index:idx_task_logs_tenant_created,priority:2;index:idx_task_logs_tenant_task_created,priority:3;index:idx_task_logs_tenant_level_created,priority:3;index:idx_task_logs_tenant_category_created,priority:3"`
